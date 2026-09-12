@@ -303,6 +303,16 @@
   $("term").addEventListener("mouseup", () => {
     if (!window.getSelection().toString()) $("input").focus();
   });
+  // 终端式:在页面任意处直接敲键,焦点自动跳到命令行(该键照常输入)
+  document.addEventListener("keydown", (e) => {
+    const tag = e.target.tagName;
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "BUTTON") return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;  // 保留 Ctrl+C 复制、快捷键等
+    // 只对可打印字符和退格接管,避免 F5/Esc/功能键被误吞
+    if (e.key.length === 1 || e.key === "Backspace") {
+      $("input").focus();  // 焦点转到输入框,当前这一键会落进去
+    }
+  });
 
   // ---- 启动 ----
   async function init() {
