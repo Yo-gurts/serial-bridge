@@ -68,6 +68,7 @@
     </select>
     <label class="chk"><input type="checkbox" id="sendHex"> HEX发送</label>
     <label class="chk"><input type="checkbox" id="localEcho"> 本地回显</label>
+    <label class="chk"><input type="checkbox" id="ansiColor" checked> ANSI颜色</label>
     <label class="chk"><input type="checkbox" id="viewHex"> HEX视图</label>
     <label class="chk"><input type="checkbox" id="autoscroll" checked> 自动滚屏</label>
     <button id="clear">清屏</button>
@@ -99,31 +100,81 @@
   const history = [];
   let histIdx = -1, draft = "";
 
+  // ---- ANSI 转义码解析 ----
+  // 设备(如 RT-Thread msh)会输出 ESC[..m 之类的颜色码。这里把 SGR 颜色码
+  // 渲染成对应颜色,其它 CSI 序列(光标移动/清屏)在滚动视图里直接吃掉。
+  const ANSI_FG = {
+    30: "#666", 31: "#f48771", 32: "#4ec9b0", 33: "#d7ba7d",
+    34: "#569cd6", 35: "#c586c0", 36: "#4ec9b0", 37: "#d4d4d4",
+    90: "#808080", 91: "#f48771", 92: "#b5cea8", 93: "#dcdcaa",
+    94: "#569cd6", 95: "#c586c0", 96: "#9cdcfe", 97: "#ffffff",
+  };
+  const ansi = { fg: null, bold: false, buf: "" };  // buf: 跨块未收全的转义序列
+  function applySGR(paramStr) {
+    let codes = paramStr.split(";").filter((x) => x !== "").map(Number);
+    if (codes.length === 0) codes = [0];
+    for (const c of codes) {
+      if (c === 0) { ansi.fg = null; ansi.bold = false; }
+      else if (c === 1) ansi.bold = true;
+      else if (c === 22) ansi.bold = false;
+      else if (c === 39) ansi.fg = null;
+      else if (ANSI_FG[c] !== undefined) ansi.fg = ANSI_FG[c];
+      // 背景色(40-47/100-107)等暂忽略
+    }
+  }
+  // 返回 [{text, fg, bold}] 段;更新 ansi 状态;不完整的转义序列缓存到下一块
+  function feedAnsi(text) {
+    const out = [];
+    const s = ansi.buf + text;
+    ansi.buf = "";
+    let i = 0, plain = "";
+    const flush = () => { if (plain) { out.push({ text: plain, fg: ansi.fg, bold: ansi.bold }); plain = ""; } };
+    while (i < s.length) {
+      if (s[i] === "\x1b") {
+        const rest = s.slice(i);
+        const m = /^\x1b\[([0-9;?]*)([A-Za-z])/.exec(rest);
+        if (m) { flush(); if (m[2] === "m") applySGR(m[1]); i += m[0].length; continue; }
+        if (/^\x1b\[?[0-9;?]*$/.test(rest)) { ansi.buf = rest; break; }  // 序列没收全,等下一块
+        i += 1; continue;  // 不认识的 ESC,跳过 ESC 本身
+      }
+      plain += s[i]; i++;
+    }
+    flush();
+    return out;
+  }
+
   // ---- 终端渲染 ----
-  // 文本视图:把 \r\n / \r 归一成换行,避免出现字面控制符;HEX 视图:显示字节
-  function segText(rec) {
-    if ($("viewHex").checked) return rec.hex + " ";
-    return rec.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  function appendSpan(box, cls, text, fg, bold) {
+    const span = document.createElement("span");
+    span.className = cls;
+    if (fg) span.style.color = fg;
+    if (bold) span.style.fontWeight = "bold";
+    span.textContent = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    box.appendChild(span);
   }
   function appendRec(rec) {
-    const term = $("term");
+    const box = $("term");
     if (rec.kind === "sys" || rec.kind === "err") {
       const div = document.createElement("div");
       div.className = "meta " + rec.kind;
       div.textContent = "— " + rec.text;
-      term.appendChild(div);
-    } else {
-      // rx/tx 用行内 span,连续追加,换行由内容里的 \n 决定 —— 不再每块一行
-      const span = document.createElement("span");
-      span.className = rec.kind;
-      span.textContent = segText(rec);
-      term.appendChild(span);
+      box.appendChild(div);
+    } else if ($("viewHex").checked) {
+      appendSpan(box, rec.kind, rec.hex + " ", null, false);
+    } else if (rec.kind === "rx") {
+      const color = $("ansiColor").checked;
+      for (const seg of feedAnsi(rec.text)) {
+        appendSpan(box, "rx", seg.text, color ? seg.fg : null, color && seg.bold);
+      }
+    } else {  // tx
+      appendSpan(box, "tx", rec.text, null, false);
     }
-    if ($("autoscroll").checked) term.scrollTop = term.scrollHeight;
+    if ($("autoscroll").checked) box.scrollTop = box.scrollHeight;
   }
   function redraw() {
-    const term = $("term");
-    term.innerHTML = "";
+    const box = $("term");
+    box.innerHTML = "";
+    ansi.fg = null; ansi.bold = false; ansi.buf = "";  // 重放前重置解析状态
     for (const r of records) appendRec(r);
   }
   function push(rec) {
@@ -242,6 +293,7 @@
   $("refresh").onclick = loadPorts;
   $("clear").onclick = () => { records = []; $("term").innerHTML = ""; $("input").focus(); };
   $("viewHex").onchange = redraw;
+  $("ansiColor").onchange = redraw;
   $("input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); doSend(); }
     else if (e.key === "ArrowUp") { e.preventDefault(); recallHistory(-1); }
