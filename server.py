@@ -6,14 +6,13 @@
 
 启动:
     python server.py --host 0.0.0.0 --port 8000 --token mysecret
-不指定 --token 时会随机生成一个并打印。
+不指定 --token 时视为免密,任何人都能连接。
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import secrets
 import time
 from pathlib import Path
 from typing import Optional, Set
@@ -41,8 +40,9 @@ def make_frame(kind: str, data: bytes) -> dict:
 
 
 class App:
-    def __init__(self, token: str) -> None:
-        self.token = token
+    def __init__(self, token: Optional[str]) -> None:
+        # token 为 None/空 表示免密
+        self.token = token or None
         self.clients: Set[WebSocket] = set()
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         # 串口回调在后台线程触发,需转发到事件循环再广播
@@ -124,14 +124,19 @@ def create_app(state: App) -> FastAPI:
     async def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @api.get("/api/config")
+    async def config() -> JSONResponse:
+        # 前端据此决定是否需要输入 token
+        return JSONResponse({"auth_required": state.token is not None})
+
     @api.get("/api/ports")
     async def ports() -> JSONResponse:
         return JSONResponse(SerialManager.list_ports())
 
     @api.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:
-        # token 校验:不匹配直接拒绝(4401)
-        if ws.query_params.get("token") != state.token:
+        # 设了 token 才校验;不匹配用 4401 关闭(前端据此提示密码错误)
+        if state.token is not None and ws.query_params.get("token") != state.token:
             await ws.close(code=4401)
             return
         await ws.accept()
@@ -156,19 +161,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="串口网络网关")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址(远程访问用 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="HTTP/WebSocket 端口")
-    parser.add_argument("--token", default=None, help="访问密钥;不填则随机生成")
+    parser.add_argument("--token", default=None, help="访问密钥;不填则免密,任何人可连接")
     args = parser.parse_args()
 
-    token = args.token or secrets.token_urlsafe(12)
-    state = App(token=token)
+    state = App(token=args.token)
     api = create_app(state)
 
     shown_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+    suffix = f"?token={args.token}" if state.token else ""
     print("=" * 56)
     print("  串口网络网关已启动")
-    print(f"  本地界面 : http://{shown_host}:{args.port}/?token={token}")
-    print(f"  WebSocket: ws://{shown_host}:{args.port}/ws?token={token}")
-    print(f"  Token    : {token}")
+    print(f"  本地界面 : http://{shown_host}:{args.port}/{suffix}")
+    print(f"  WebSocket: ws://{shown_host}:{args.port}/ws{suffix}")
+    if state.token:
+        print(f"  Token    : {args.token}")
+    else:
+        print("  Token    : (未设置,免密访问 —— 如需限制请加 --token)")
     if args.host in ("0.0.0.0", "::"):
         print("  (已监听所有网卡,远程可用本机局域网 IP 替换上面的地址)")
     print("=" * 56)

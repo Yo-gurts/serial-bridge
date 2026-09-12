@@ -38,7 +38,8 @@
 
   .send { display: flex; gap: 8px; align-items: center; padding: 8px 12px;
           background: var(--panel); border-top: 1px solid var(--border); }
-  .send input[type=text] { flex: 1; }
+  .prompt { color: var(--accent); font-family: "Cascadia Code", Consolas, monospace; font-weight: bold; }
+  #input { flex: 1; font-family: "Cascadia Code", Consolas, monospace; }
   .chk { display: flex; align-items: center; gap: 4px; color: var(--sys); user-select: none; }
 </style>
 </head>
@@ -67,7 +68,8 @@
   </div>
 
   <div class="send">
-    <input type="text" id="input" placeholder="输入要发送的内容,回车发送…" autocomplete="off">
+    <span class="prompt">❯</span>
+    <input type="text" id="input" placeholder="输入命令,回车发送(↑↓ 翻历史)" autocomplete="off" spellcheck="false">
     <label class="chk"><input type="checkbox" id="sendHex"> HEX</label>
     <label>结尾</label>
     <select id="eol">
@@ -76,7 +78,6 @@
       <option value="\n">LF</option>
       <option value="\r\n" selected>CRLF</option>
     </select>
-    <button id="send" class="primary">发送</button>
   </div>
 
 <script>
@@ -84,10 +85,12 @@
   "use strict";
   const $ = (id) => document.getElementById(id);
   const params = new URLSearchParams(location.search);
-  let token = params.get("token");
-  if (!token) { token = prompt("请输入访问 token:") || ""; }
 
+  let token = params.get("token") || "";
+  let authRequired = false;      // 由 /api/config 决定是否需要密码
   let ws = null, serOpen = false, records = [];
+  const history = [];            // 已发送命令历史
+  let histIdx = -1, draft = "";  // ↑↓ 浏览历史时的游标与草稿
 
   // ---- 渲染 ----
   function fmtTs(ts) {
@@ -141,11 +144,20 @@
   // ---- WebSocket ----
   function connect() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
+    const q = authRequired ? `?token=${encodeURIComponent(token)}` : "";
+    ws = new WebSocket(`${proto}//${location.host}/ws${q}`);
     ws.onopen = () => { $("wsdot").className = "dot on"; sys("已连接到网关服务"); };
     ws.onclose = (e) => {
       $("wsdot").className = "dot off";
-      if (e.code === 4401) { err("token 无效,连接被拒绝"); return; }
+      if (e.code === 4401) {
+        // 密码错误:明确提示并重新输入,然后重连
+        err("访问密码错误,请重新输入");
+        const t = prompt("访问密码错误,请重新输入 token:");
+        if (t === null) { err("已取消,未连接"); return; }
+        token = t;
+        connect();
+        return;
+      }
       sys("与服务断开,3 秒后重连…");
       setTimeout(connect, 3000);
     };
@@ -186,10 +198,35 @@
     if (!ws || ws.readyState !== WebSocket.OPEN) { err("未连接到服务"); return; }
     if (!serOpen) { err("串口未打开"); return; }
     const hexMode = $("sendHex").checked;
-    let data = $("input").value;
+    const raw = $("input").value;
+    let data = raw;
     if (!hexMode) data += $("eol").value;   // HEX 模式不追加行结尾
     ws.send(JSON.stringify({ type: "tx", data, encoding: hexMode ? "hex" : "utf8" }));
+    // 记入历史(去掉与上一条重复的空行)
+    if (raw !== "" && history[history.length - 1] !== raw) history.push(raw);
+    histIdx = -1; draft = "";
     $("input").value = "";
+  }
+
+  // ---- 历史浏览(↑↓)----
+  function recallHistory(dir) {
+    const inp = $("input");
+    if (history.length === 0) return;
+    if (histIdx === -1) {                       // 刚开始翻:先存当前草稿
+      if (dir < 0) { draft = inp.value; histIdx = history.length - 1; }
+      else return;
+    } else {
+      histIdx += dir;
+    }
+    if (histIdx >= history.length) {            // 翻回到底:恢复草稿
+      histIdx = -1; inp.value = draft;
+    } else if (histIdx < 0) {
+      histIdx = 0; inp.value = history[0];
+    } else {
+      inp.value = history[histIdx];
+    }
+    // 光标移到末尾
+    requestAnimationFrame(() => inp.setSelectionRange(inp.value.length, inp.value.length));
   }
 
   // ---- 事件绑定 ----
@@ -200,16 +237,35 @@
       if (!port) { err("请先选择端口"); return; }
       ws.send(JSON.stringify({ type: "open", port, baudrate: parseInt($("baud").value, 10) }));
     }
+    $("input").focus();
   };
   $("refresh").onclick = loadPorts;
-  $("clear").onclick = () => { records = []; $("log").innerHTML = ""; };
+  $("clear").onclick = () => { records = []; $("log").innerHTML = ""; $("input").focus(); };
   $("viewHex").onchange = redraw;
-  $("send").onclick = doSend;
-  $("input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doSend(); } });
+  $("input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); doSend(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); recallHistory(-1); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); recallHistory(1); }
+  });
+  // 终端式:点日志区/进入页面自动把焦点给输入框(选中文字时不抢焦点)
+  $("log").addEventListener("mouseup", () => {
+    if (!window.getSelection().toString()) $("input").focus();
+  });
 
   // ---- 启动 ----
-  loadPorts();
-  connect();
+  async function init() {
+    try {
+      const cfg = await (await fetch("/api/config")).json();
+      authRequired = !!cfg.auth_required;
+    } catch (e) { /* 拿不到就按需要密码处理,连接失败会再提示 */ }
+    if (authRequired && !token) {
+      token = prompt("请输入访问 token:") || "";
+    }
+    loadPorts();
+    connect();
+    $("input").focus();
+  }
+  init();
 })();
 </script>
 </body>
