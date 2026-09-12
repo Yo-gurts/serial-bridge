@@ -122,7 +122,9 @@ def create_app(state: App) -> FastAPI:
 
     @api.get("/")
     async def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+        # 禁止缓存,避免改了前端后浏览器仍显示旧页面
+        headers = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
+        return FileResponse(STATIC_DIR / "index.html", headers=headers)
 
     @api.get("/api/config")
     async def config() -> JSONResponse:
