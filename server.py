@@ -20,6 +20,7 @@ from typing import Optional, Set
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from serial_manager import SerialManager
 
@@ -134,6 +135,9 @@ def create_app(state: App) -> FastAPI:
     @api.get("/api/ports")
     async def ports() -> JSONResponse:
         return JSONResponse(SerialManager.list_ports())
+
+    # 静态资源(xterm.js 等)。放在路由定义之后挂载,避免覆盖上面的接口。
+    api.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     @api.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:

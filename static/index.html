@@ -4,10 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>串口网络网关</title>
+<link rel="stylesheet" href="/static/vendor/xterm.css">
 <style>
   :root {
     --bg: #1e1e1e; --panel: #252526; --border: #3c3c3c; --fg: #d4d4d4;
-    --rx: #d4d4d4; --tx: #569cd6; --sys: #808080; --err: #f48771; --accent: #0e639c;
+    --tx: #569cd6; --sys: #808080; --err: #f48771; --accent: #0e639c;
   }
   * { box-sizing: border-box; }
   body { margin: 0; height: 100vh; display: flex; flex-direction: column;
@@ -30,14 +31,9 @@
   .spacer { flex: 1; }
   .sep { width: 1px; align-self: stretch; background: var(--border); margin: 0 2px; }
 
-  /* 终端区:连续流式输出,像真终端 */
-  #term { flex: 1; overflow-y: auto; padding: 8px 12px; margin: 0;
-          font-family: "Cascadia Code", Consolas, monospace; font-size: 13px; line-height: 1.45;
-          white-space: pre-wrap; word-break: break-all; }
-  #term .rx { color: var(--rx); }
-  #term .tx { color: var(--tx); }
-  #term .meta { display: block; color: var(--sys); font-style: italic; }
-  #term .meta.err { color: var(--err); font-style: normal; }
+  /* xterm.js 挂载容器 */
+  #term { flex: 1; min-height: 0; padding: 6px 8px; background: var(--bg); overflow: hidden; }
+  .xterm { height: 100%; }
 
   .send { display: flex; gap: 8px; align-items: center; padding: 8px 12px;
           background: var(--panel); border-top: 1px solid var(--border); }
@@ -47,7 +43,7 @@
 </style>
 </head>
 <body>
-  <!-- 配置工具栏:端口 / 波特率 / 各种选项都在这 -->
+  <!-- 配置工具栏 -->
   <div class="bar">
     <label>端口</label>
     <select id="port"></select>
@@ -59,133 +55,71 @@
     </select>
     <button id="toggle" class="primary">打开</button>
     <span class="sep"></span>
-    <label>换行</label>
-    <select id="eol">
-      <option value="none">无</option>
-      <option value="cr">CR</option>
-      <option value="lf">LF</option>
-      <option value="crlf" selected>CRLF</option>
-    </select>
-    <label class="chk"><input type="checkbox" id="sendHex"> HEX发送</label>
-    <label class="chk"><input type="checkbox" id="localEcho"> 本地回显</label>
-    <label class="chk"><input type="checkbox" id="ansiColor" checked> ANSI颜色</label>
-    <label class="chk"><input type="checkbox" id="viewHex"> HEX视图</label>
-    <label class="chk"><input type="checkbox" id="autoscroll" checked> 自动滚屏</label>
     <button id="clear">清屏</button>
     <span class="spacer"></span>
     <label class="chk"><span class="dot" id="wsdot"></span> 服务</label>
     <label class="chk"><span class="dot" id="serdot"></span> <span id="serlabel">串口未打开</span></label>
   </div>
 
+  <!-- 实时终端:直接在这里敲,按键(含 Tab/退格/方向键)实时发给设备 -->
   <div id="term"></div>
 
-  <!-- 命令行:回车即发,↑↓ 翻历史 -->
+  <!-- 辅助发送栏:整行/HEX 发送(可选,主要交互直接在上面终端里敲) -->
   <div class="send">
     <span class="prompt">❯</span>
-    <input type="text" id="input" placeholder="输入命令,回车发送(↑↓ 翻历史)" autocomplete="off" spellcheck="false">
+    <input type="text" id="input" placeholder="整行发送(回车)/ 勾 HEX 按十六进制发送;直接在上方终端敲则实时发送" autocomplete="off" spellcheck="false">
+    <label class="chk"><input type="checkbox" id="sendHex"> HEX</label>
+    <label>结尾</label>
+    <select id="eol">
+      <option value="none">无</option>
+      <option value="cr">CR</option>
+      <option value="lf">LF</option>
+      <option value="crlf" selected>CRLF</option>
+    </select>
+    <button id="send" class="primary">发送</button>
   </div>
 
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/addon-fit.js"></script>
 <script>
 (function () {
   "use strict";
   const $ = (id) => document.getElementById(id);
   const params = new URLSearchParams(location.search);
-
-  // 换行选项 -> 真实控制字符(HTML 属性里的 \r\n 是字面字符,必须在 JS 里映射)
   const EOL = { none: "", cr: "\r", lf: "\n", crlf: "\r\n" };
 
   let token = params.get("token") || "";
   let authRequired = false;
-  let ws = null, serOpen = false, records = [];
+  let ws = null, serOpen = false;
   const history = [];
   let histIdx = -1, draft = "";
 
-  // ---- ANSI 转义码解析 ----
-  // 设备(如 RT-Thread msh)会输出 ESC[..m 之类的颜色码。这里把 SGR 颜色码
-  // 渲染成对应颜色,其它 CSI 序列(光标移动/清屏)在滚动视图里直接吃掉。
-  const ANSI_FG = {
-    30: "#666", 31: "#f48771", 32: "#4ec9b0", 33: "#d7ba7d",
-    34: "#569cd6", 35: "#c586c0", 36: "#4ec9b0", 37: "#d4d4d4",
-    90: "#808080", 91: "#f48771", 92: "#b5cea8", 93: "#dcdcaa",
-    94: "#569cd6", 95: "#c586c0", 96: "#9cdcfe", 97: "#ffffff",
-  };
-  const ansi = { fg: null, bold: false, buf: "" };  // buf: 跨块未收全的转义序列
-  function applySGR(paramStr) {
-    let codes = paramStr.split(";").filter((x) => x !== "").map(Number);
-    if (codes.length === 0) codes = [0];
-    for (const c of codes) {
-      if (c === 0) { ansi.fg = null; ansi.bold = false; }
-      else if (c === 1) ansi.bold = true;
-      else if (c === 22) ansi.bold = false;
-      else if (c === 39) ansi.fg = null;
-      else if (ANSI_FG[c] !== undefined) ansi.fg = ANSI_FG[c];
-      // 背景色(40-47/100-107)等暂忽略
-    }
-  }
-  // 返回 [{text, fg, bold}] 段;更新 ansi 状态;不完整的转义序列缓存到下一块
-  function feedAnsi(text) {
-    const out = [];
-    const s = ansi.buf + text;
-    ansi.buf = "";
-    let i = 0, plain = "";
-    const flush = () => { if (plain) { out.push({ text: plain, fg: ansi.fg, bold: ansi.bold }); plain = ""; } };
-    while (i < s.length) {
-      if (s[i] === "\x1b") {
-        const rest = s.slice(i);
-        const m = /^\x1b\[([0-9;?]*)([A-Za-z])/.exec(rest);
-        if (m) { flush(); if (m[2] === "m") applySGR(m[1]); i += m[0].length; continue; }
-        if (/^\x1b\[?[0-9;?]*$/.test(rest)) { ansi.buf = rest; break; }  // 序列没收全,等下一块
-        i += 1; continue;  // 不认识的 ESC,跳过 ESC 本身
-      }
-      plain += s[i]; i++;
-    }
-    flush();
-    return out;
-  }
+  // ---- xterm.js 终端 ----
+  const term = new Terminal({
+    fontFamily: '"Cascadia Code", Consolas, "Courier New", monospace',
+    fontSize: 13,
+    cursorBlink: true,
+    scrollback: 8000,
+    theme: { background: "#1e1e1e", foreground: "#d4d4d4", cursor: "#d4d4d4" },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open($("term"));
+  fit.fit();
+  window.addEventListener("resize", () => { try { fit.fit(); } catch (e) {} });
 
-  // ---- 终端渲染 ----
-  function appendSpan(box, cls, text, fg, bold) {
-    const span = document.createElement("span");
-    span.className = cls;
-    if (fg) span.style.color = fg;
-    if (bold) span.style.fontWeight = "bold";
-    span.textContent = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    box.appendChild(span);
-  }
-  function appendRec(rec) {
-    const box = $("term");
-    if (rec.kind === "sys" || rec.kind === "err") {
-      const div = document.createElement("div");
-      div.className = "meta " + rec.kind;
-      div.textContent = "— " + rec.text;
-      box.appendChild(div);
-    } else if ($("viewHex").checked) {
-      appendSpan(box, rec.kind, rec.hex + " ", null, false);
-    } else if (rec.kind === "rx") {
-      const color = $("ansiColor").checked;
-      for (const seg of feedAnsi(rec.text)) {
-        appendSpan(box, "rx", seg.text, color ? seg.fg : null, color && seg.bold);
-      }
-    } else {  // tx
-      appendSpan(box, "tx", rec.text, null, false);
-    }
-    if ($("autoscroll").checked) box.scrollTop = box.scrollHeight;
-  }
-  function redraw() {
-    const box = $("term");
-    box.innerHTML = "";
-    ansi.fg = null; ansi.bold = false; ansi.buf = "";  // 重放前重置解析状态
-    for (const r of records) appendRec(r);
-  }
-  function push(rec) {
-    records.push(rec);
-    if (records.length > 10000) records = records.slice(-8000);
-    appendRec(rec);
-  }
-  const sys = (t) => push({ kind: "sys", text: t });
-  const err = (t) => push({ kind: "err", text: t });
+  // 系统提示行(灰色斜体),不影响设备数据流
+  function sysline(t) { term.writeln("\x1b[90m— " + t + "\x1b[0m"); }
+  function errline(t) { term.writeln("\x1b[31m— " + t + "\x1b[0m"); }
 
-  // ---- 串口状态 UI ----
+  // 终端里敲的键(xterm 已编码成字节:Tab=\t 退格=\x7f 方向键=ESC[.. 等)直接发串口
+  term.onData((data) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!serOpen) return;
+    ws.send(JSON.stringify({ type: "tx", data, encoding: "utf8" }));
+  });
+
+  // ---- 串口状态 ----
   function setSerial(status) {
     serOpen = !!status.open;
     $("serdot").className = "dot " + (serOpen ? "on" : "off");
@@ -193,7 +127,8 @@
     $("toggle").textContent = serOpen ? "关闭" : "打开";
     $("port").disabled = serOpen;
     $("baud").disabled = serOpen;
-    if (status.error) err("串口错误: " + status.error);
+    if (status.error) errline("串口错误: " + status.error);
+    if (serOpen) term.focus();
   }
 
   // ---- WebSocket ----
@@ -201,28 +136,25 @@
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const q = authRequired ? `?token=${encodeURIComponent(token)}` : "";
     ws = new WebSocket(`${proto}//${location.host}/ws${q}`);
-    ws.onopen = () => { $("wsdot").className = "dot on"; sys("已连接到网关服务"); };
+    ws.onopen = () => { $("wsdot").className = "dot on"; sysline("已连接到网关服务"); };
     ws.onclose = (e) => {
       $("wsdot").className = "dot off";
       if (e.code === 4401) {
-        err("访问密码错误,请重新输入");
+        errline("访问密码错误,请重新输入");
         const t = prompt("访问密码错误,请重新输入 token:");
-        if (t === null) { err("已取消,未连接"); return; }
-        token = t;
-        connect();
-        return;
+        if (t === null) { errline("已取消,未连接"); return; }
+        token = t; connect(); return;
       }
-      sys("与服务断开,3 秒后重连…");
+      sysline("与服务断开,3 秒后重连…");
       setTimeout(connect, 3000);
     };
     ws.onerror = () => {};
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.type === "rx") {
-        push({ kind: "rx", hex: msg.hex, text: msg.text });
+        term.write(msg.text);                 // 设备数据交给 xterm 解释(含 ANSI/退格/光标)
       } else if (msg.type === "tx") {
-        // 默认不本地回显(设备通常会回显);勾了「本地回显」才显示自己发的
-        if ($("localEcho").checked) push({ kind: "tx", hex: msg.hex, text: msg.text });
+        // 设备通常会回显自己收到的字符;终端里已由回显呈现,故不再重复写入
       } else if (msg.type === "status") {
         setSerial(msg);
       }
@@ -247,33 +179,28 @@
         sel.appendChild(o);
       }
       if (prev) sel.value = prev;
-    } catch (e) { err("获取端口列表失败: " + e); }
+    } catch (e) { errline("获取端口列表失败: " + e); }
   }
 
-  // ---- 发送 ----
-  function doSend() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) { err("未连接到服务"); return; }
-    if (!serOpen) { err("串口未打开"); return; }
+  // ---- 辅助发送栏:整行/HEX 发送 ----
+  function sendLine() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { errline("未连接到服务"); return; }
+    if (!serOpen) { errline("串口未打开"); return; }
     const hexMode = $("sendHex").checked;
     const raw = $("input").value;
     let data = raw;
-    if (!hexMode) data += EOL[$("eol").value] || "";   // HEX 模式不追加行结尾
+    if (!hexMode) data += EOL[$("eol").value] || "";
     ws.send(JSON.stringify({ type: "tx", data, encoding: hexMode ? "hex" : "utf8" }));
     if (raw !== "" && history[history.length - 1] !== raw) history.push(raw);
     histIdx = -1; draft = "";
     $("input").value = "";
+    term.focus();
   }
-
-  // ---- 历史浏览(↑↓)----
   function recallHistory(dir) {
     const inp = $("input");
     if (history.length === 0) return;
-    if (histIdx === -1) {
-      if (dir < 0) { draft = inp.value; histIdx = history.length - 1; }
-      else return;
-    } else {
-      histIdx += dir;
-    }
+    if (histIdx === -1) { if (dir < 0) { draft = inp.value; histIdx = history.length - 1; } else return; }
+    else { histIdx += dir; }
     if (histIdx >= history.length) { histIdx = -1; inp.value = draft; }
     else if (histIdx < 0) { histIdx = 0; inp.value = history[0]; }
     else { inp.value = history[histIdx]; }
@@ -285,33 +212,18 @@
     if (serOpen) { ws.send(JSON.stringify({ type: "close" })); }
     else {
       const port = $("port").value;
-      if (!port) { err("请先选择端口"); return; }
+      if (!port) { errline("请先选择端口"); return; }
       ws.send(JSON.stringify({ type: "open", port, baudrate: parseInt($("baud").value, 10) }));
     }
-    $("input").focus();
+    term.focus();
   };
   $("refresh").onclick = loadPorts;
-  $("clear").onclick = () => { records = []; $("term").innerHTML = ""; $("input").focus(); };
-  $("viewHex").onchange = redraw;
-  $("ansiColor").onchange = redraw;
+  $("clear").onclick = () => { term.clear(); term.focus(); };
+  $("send").onclick = sendLine;
   $("input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); doSend(); }
+    if (e.key === "Enter") { e.preventDefault(); sendLine(); }
     else if (e.key === "ArrowUp") { e.preventDefault(); recallHistory(-1); }
     else if (e.key === "ArrowDown") { e.preventDefault(); recallHistory(1); }
-  });
-  // 点终端区自动聚焦输入框(选中文字复制时不抢焦点)
-  $("term").addEventListener("mouseup", () => {
-    if (!window.getSelection().toString()) $("input").focus();
-  });
-  // 终端式:在页面任意处直接敲键,焦点自动跳到命令行(该键照常输入)
-  document.addEventListener("keydown", (e) => {
-    const tag = e.target.tagName;
-    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "BUTTON") return;
-    if (e.ctrlKey || e.metaKey || e.altKey) return;  // 保留 Ctrl+C 复制、快捷键等
-    // 只对可打印字符和退格接管,避免 F5/Esc/功能键被误吞
-    if (e.key.length === 1 || e.key === "Backspace") {
-      $("input").focus();  // 焦点转到输入框,当前这一键会落进去
-    }
   });
 
   // ---- 启动 ----
@@ -323,7 +235,7 @@
     if (authRequired && !token) token = prompt("请输入访问 token:") || "";
     loadPorts();
     connect();
-    $("input").focus();
+    term.focus();
   }
   init();
 })();
