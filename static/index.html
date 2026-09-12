@@ -7,7 +7,7 @@
 <style>
   :root {
     --bg: #1e1e1e; --panel: #252526; --border: #3c3c3c; --fg: #d4d4d4;
-    --rx: #4ec9b0; --tx: #569cd6; --sys: #808080; --err: #f48771; --accent: #0e639c;
+    --rx: #d4d4d4; --tx: #569cd6; --sys: #808080; --err: #f48771; --accent: #0e639c;
   }
   * { box-sizing: border-box; }
   body { margin: 0; height: 100vh; display: flex; flex-direction: column;
@@ -28,13 +28,16 @@
   .dot { width: 10px; height: 10px; border-radius: 50%; background: #888; display: inline-block; }
   .dot.on { background: #4caf50; } .dot.off { background: #c0392b; }
   .spacer { flex: 1; }
+  .sep { width: 1px; align-self: stretch; background: var(--border); margin: 0 2px; }
 
-  #log { flex: 1; overflow-y: auto; padding: 8px 12px; margin: 0;
-         font-family: "Cascadia Code", Consolas, monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
-  .line .ts { color: var(--sys); margin-right: 8px; }
-  .line .tag { font-weight: bold; margin-right: 8px; }
-  .rx .tag { color: var(--rx); } .tx .tag { color: var(--tx); }
-  .sys { color: var(--sys); } .err { color: var(--err); }
+  /* 终端区:连续流式输出,像真终端 */
+  #term { flex: 1; overflow-y: auto; padding: 8px 12px; margin: 0;
+          font-family: "Cascadia Code", Consolas, monospace; font-size: 13px; line-height: 1.45;
+          white-space: pre-wrap; word-break: break-all; }
+  #term .rx { color: var(--rx); }
+  #term .tx { color: var(--tx); }
+  #term .meta { display: block; color: var(--sys); font-style: italic; }
+  #term .meta.err { color: var(--err); font-style: normal; }
 
   .send { display: flex; gap: 8px; align-items: center; padding: 8px 12px;
           background: var(--panel); border-top: 1px solid var(--border); }
@@ -44,6 +47,7 @@
 </style>
 </head>
 <body>
+  <!-- 配置工具栏:端口 / 波特率 / 各种选项都在这 -->
   <div class="bar">
     <label>端口</label>
     <select id="port"></select>
@@ -54,30 +58,30 @@
       <option>57600</option><option selected>115200</option><option>230400</option><option>460800</option><option>921600</option>
     </select>
     <button id="toggle" class="primary">打开</button>
+    <span class="sep"></span>
+    <label>换行</label>
+    <select id="eol">
+      <option value="none">无</option>
+      <option value="cr">CR</option>
+      <option value="lf">LF</option>
+      <option value="crlf" selected>CRLF</option>
+    </select>
+    <label class="chk"><input type="checkbox" id="sendHex"> HEX发送</label>
+    <label class="chk"><input type="checkbox" id="localEcho"> 本地回显</label>
+    <label class="chk"><input type="checkbox" id="viewHex"> HEX视图</label>
+    <label class="chk"><input type="checkbox" id="autoscroll" checked> 自动滚屏</label>
+    <button id="clear">清屏</button>
     <span class="spacer"></span>
-    <label class="chk"><span class="dot" id="wsdot"></span> 服务连接</label>
+    <label class="chk"><span class="dot" id="wsdot"></span> 服务</label>
     <label class="chk"><span class="dot" id="serdot"></span> <span id="serlabel">串口未打开</span></label>
   </div>
 
-  <pre id="log"></pre>
+  <div id="term"></div>
 
-  <div class="bar" style="border-top:1px solid var(--border); border-bottom:none;">
-    <label class="chk"><input type="checkbox" id="viewHex"> HEX 视图</label>
-    <label class="chk"><input type="checkbox" id="autoscroll" checked> 自动滚屏</label>
-    <button id="clear">清屏</button>
-  </div>
-
+  <!-- 命令行:回车即发,↑↓ 翻历史 -->
   <div class="send">
     <span class="prompt">❯</span>
     <input type="text" id="input" placeholder="输入命令,回车发送(↑↓ 翻历史)" autocomplete="off" spellcheck="false">
-    <label class="chk"><input type="checkbox" id="sendHex"> HEX</label>
-    <label>结尾</label>
-    <select id="eol">
-      <option value="">无</option>
-      <option value="\r">CR</option>
-      <option value="\n">LF</option>
-      <option value="\r\n" selected>CRLF</option>
-    </select>
   </div>
 
 <script>
@@ -86,46 +90,46 @@
   const $ = (id) => document.getElementById(id);
   const params = new URLSearchParams(location.search);
 
-  let token = params.get("token") || "";
-  let authRequired = false;      // 由 /api/config 决定是否需要密码
-  let ws = null, serOpen = false, records = [];
-  const history = [];            // 已发送命令历史
-  let histIdx = -1, draft = "";  // ↑↓ 浏览历史时的游标与草稿
+  // 换行选项 -> 真实控制字符(HTML 属性里的 \r\n 是字面字符,必须在 JS 里映射)
+  const EOL = { none: "", cr: "\r", lf: "\n", crlf: "\r\n" };
 
-  // ---- 渲染 ----
-  function fmtTs(ts) {
-    const d = new Date(ts * 1000);
-    const p = (n, l = 2) => String(n).padStart(l, "0");
-    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+  let token = params.get("token") || "";
+  let authRequired = false;
+  let ws = null, serOpen = false, records = [];
+  const history = [];
+  let histIdx = -1, draft = "";
+
+  // ---- 终端渲染 ----
+  // 文本视图:把 \r\n / \r 归一成换行,避免出现字面控制符;HEX 视图:显示字节
+  function segText(rec) {
+    if ($("viewHex").checked) return rec.hex + " ";
+    return rec.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   }
-  function renderLine(rec) {
-    const hex = $("viewHex").checked;
-    const body = rec.kind === "sys" || rec.kind === "err" ? rec.text : (hex ? rec.hex : rec.text);
-    const tag = { rx: "RX ←", tx: "TX →", sys: "··", err: "!!" }[rec.kind] || "";
-    const div = document.createElement("div");
-    div.className = "line " + rec.kind;
+  function appendRec(rec) {
+    const term = $("term");
     if (rec.kind === "sys" || rec.kind === "err") {
-      div.textContent = `[${fmtTs(rec.ts)}] ${body}`;
+      const div = document.createElement("div");
+      div.className = "meta " + rec.kind;
+      div.textContent = "— " + rec.text;
+      term.appendChild(div);
     } else {
-      div.innerHTML = `<span class="ts">${fmtTs(rec.ts)}</span><span class="tag">${tag}</span>` +
-                      `<span class="txt"></span>`;
-      div.querySelector(".txt").textContent = body;
+      // rx/tx 用行内 span,连续追加,换行由内容里的 \n 决定 —— 不再每块一行
+      const span = document.createElement("span");
+      span.className = rec.kind;
+      span.textContent = segText(rec);
+      term.appendChild(span);
     }
-    return div;
+    if ($("autoscroll").checked) term.scrollTop = term.scrollHeight;
   }
   function redraw() {
-    const log = $("log");
-    log.innerHTML = "";
-    for (const rec of records) log.appendChild(renderLine(rec));
-    if ($("autoscroll").checked) log.scrollTop = log.scrollHeight;
+    const term = $("term");
+    term.innerHTML = "";
+    for (const r of records) appendRec(r);
   }
   function push(rec) {
-    if (!rec.ts) rec.ts = Date.now() / 1000;
     records.push(rec);
-    if (records.length > 5000) records = records.slice(-4000);
-    const log = $("log");
-    log.appendChild(renderLine(rec));
-    if ($("autoscroll").checked) log.scrollTop = log.scrollHeight;
+    if (records.length > 10000) records = records.slice(-8000);
+    appendRec(rec);
   }
   const sys = (t) => push({ kind: "sys", text: t });
   const err = (t) => push({ kind: "err", text: t });
@@ -150,7 +154,6 @@
     ws.onclose = (e) => {
       $("wsdot").className = "dot off";
       if (e.code === 4401) {
-        // 密码错误:明确提示并重新输入,然后重连
         err("访问密码错误,请重新输入");
         const t = prompt("访问密码错误,请重新输入 token:");
         if (t === null) { err("已取消,未连接"); return; }
@@ -164,8 +167,11 @@
     ws.onerror = () => {};
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.type === "rx" || msg.type === "tx") {
-        push({ kind: msg.type, ts: msg.ts, hex: msg.hex, text: msg.text });
+      if (msg.type === "rx") {
+        push({ kind: "rx", hex: msg.hex, text: msg.text });
+      } else if (msg.type === "tx") {
+        // 默认不本地回显(设备通常会回显);勾了「本地回显」才显示自己发的
+        if ($("localEcho").checked) push({ kind: "tx", hex: msg.hex, text: msg.text });
       } else if (msg.type === "status") {
         setSerial(msg);
       }
@@ -200,9 +206,8 @@
     const hexMode = $("sendHex").checked;
     const raw = $("input").value;
     let data = raw;
-    if (!hexMode) data += $("eol").value;   // HEX 模式不追加行结尾
+    if (!hexMode) data += EOL[$("eol").value] || "";   // HEX 模式不追加行结尾
     ws.send(JSON.stringify({ type: "tx", data, encoding: hexMode ? "hex" : "utf8" }));
-    // 记入历史(去掉与上一条重复的空行)
     if (raw !== "" && history[history.length - 1] !== raw) history.push(raw);
     histIdx = -1; draft = "";
     $("input").value = "";
@@ -212,20 +217,15 @@
   function recallHistory(dir) {
     const inp = $("input");
     if (history.length === 0) return;
-    if (histIdx === -1) {                       // 刚开始翻:先存当前草稿
+    if (histIdx === -1) {
       if (dir < 0) { draft = inp.value; histIdx = history.length - 1; }
       else return;
     } else {
       histIdx += dir;
     }
-    if (histIdx >= history.length) {            // 翻回到底:恢复草稿
-      histIdx = -1; inp.value = draft;
-    } else if (histIdx < 0) {
-      histIdx = 0; inp.value = history[0];
-    } else {
-      inp.value = history[histIdx];
-    }
-    // 光标移到末尾
+    if (histIdx >= history.length) { histIdx = -1; inp.value = draft; }
+    else if (histIdx < 0) { histIdx = 0; inp.value = history[0]; }
+    else { inp.value = history[histIdx]; }
     requestAnimationFrame(() => inp.setSelectionRange(inp.value.length, inp.value.length));
   }
 
@@ -240,15 +240,15 @@
     $("input").focus();
   };
   $("refresh").onclick = loadPorts;
-  $("clear").onclick = () => { records = []; $("log").innerHTML = ""; $("input").focus(); };
+  $("clear").onclick = () => { records = []; $("term").innerHTML = ""; $("input").focus(); };
   $("viewHex").onchange = redraw;
   $("input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); doSend(); }
     else if (e.key === "ArrowUp") { e.preventDefault(); recallHistory(-1); }
     else if (e.key === "ArrowDown") { e.preventDefault(); recallHistory(1); }
   });
-  // 终端式:点日志区/进入页面自动把焦点给输入框(选中文字时不抢焦点)
-  $("log").addEventListener("mouseup", () => {
+  // 点终端区自动聚焦输入框(选中文字复制时不抢焦点)
+  $("term").addEventListener("mouseup", () => {
     if (!window.getSelection().toString()) $("input").focus();
   });
 
@@ -257,10 +257,8 @@
     try {
       const cfg = await (await fetch("/api/config")).json();
       authRequired = !!cfg.auth_required;
-    } catch (e) { /* 拿不到就按需要密码处理,连接失败会再提示 */ }
-    if (authRequired && !token) {
-      token = prompt("请输入访问 token:") || "";
-    }
+    } catch (e) { /* 拿不到就靠连接失败时再提示 */ }
+    if (authRequired && !token) token = prompt("请输入访问 token:") || "";
     loadPorts();
     connect();
     $("input").focus();
