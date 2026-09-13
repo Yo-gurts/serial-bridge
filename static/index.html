@@ -27,7 +27,7 @@
     background: var(--inbg); color: var(--fg); border: 1px solid var(--border);
     border-radius: 4px; padding: 5px 8px; font-size: 14px; font-family: inherit; }
   button { cursor: pointer; }
-  button:hover { background: #3e3e42; }
+  button:hover { background: var(--border); }
   button.primary { background: var(--accent); border-color: var(--accent); }
   button.primary:hover { background: #1177bb; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -43,8 +43,8 @@
 
   .chk { display: flex; align-items: center; gap: 4px; color: var(--sys); user-select: none; }
   #macrobar { padding: 6px 12px; }
-  #macros button { padding: 3px 10px; background: #2d2d30; }
-  #macros button:hover { background: #3e3e42; }
+  #macros button { padding: 3px 10px; background: var(--inbg); color: var(--fg); }
+  #macros button:hover { background: var(--border); }
   #macros:empty::before { content: "快捷命令(点 ＋ 添加,右键删除)"; color: var(--sys); font-size: 12px; }
 </style>
 </head>
@@ -67,6 +67,7 @@
     <label class="chk"><input type="checkbox" id="ts" checked> 时间戳</label>
     <button id="find" title="搜索 (Ctrl+F)">🔍</button>
     <button id="save" title="导出日志为 .txt">保存</button>
+    <button id="full" title="全屏 (F11)">⛶</button>
     <button id="clear">清屏</button>
     <span class="spacer"></span>
     <label class="chk"><span class="dot" id="wsdot"></span> 服务</label>
@@ -148,6 +149,21 @@
   // 系统提示行(灰色斜体),不影响设备数据流
   function sysline(t) { term.writeln("\x1b[90m— " + t + "\x1b[0m"); }
   function errline(t) { term.writeln("\x1b[31m— " + t + "\x1b[0m"); }
+
+  // ---- Ctrl+L:把当前行滚到视口顶部(标准终端做法,不清历史)----
+  // 用 SU(向上滚动)把光标上方的行推入回滚缓冲(仍可上滚查看),再用 CUU 让
+  // 光标跟着回到当前行,不与设备光标脱节。不是 term.clear()(那会清掉回滚)。
+  function clearToTop() {
+    const y = term.buffer.active.cursorY;   // 光标在视口内的行号(上方有 y 行)
+    if (y > 0) term.write("\x1b[" + y + "S\x1b[" + y + "A");
+  }
+  // 阻止 xterm 把 Ctrl+L 当 0x0C 发给设备(改由下面的 document 处理器本地滚屏)
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type === "keydown" && e.ctrlKey && !e.altKey && !e.metaKey && (e.key === "l" || e.key === "L")) {
+      return false;
+    }
+    return true;
+  });
 
   // ---- 错误/警告关键词高亮 ----
   // 在设备数据写入 xterm 前,给常见错误词包上 ANSI 颜色(红=错误,黄=警告)。
@@ -346,10 +362,32 @@
   $("refresh").onclick = loadPorts;
   $("save").onclick = saveLog;
   $("clear").onclick = () => { term.clear(); tsPending = true; term.focus(); };
-  // Ctrl+F 唤出搜索(拦截浏览器默认查找)
+
+  // ---- 全屏(Fullscreen API)----
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      (document.documentElement.requestFullscreen || function () {})
+        .call(document.documentElement);
+    }
+  }
+  $("full").onclick = toggleFullscreen;
+  // 进出全屏后重算终端尺寸
+  document.addEventListener("fullscreenchange", () => { try { fit.fit(); } catch (e) {} });
+
   document.addEventListener("keydown", (e) => {
+    // Ctrl+F 唤出搜索(拦截浏览器默认查找)
     if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F")) {
       e.preventDefault(); openSearch();
+    }
+    // F11 进入/退出全屏(接管浏览器默认全屏,统一走 Fullscreen API)
+    else if (e.key === "F11") {
+      e.preventDefault(); toggleFullscreen();
+    }
+    // Ctrl+L 把当前行滚到顶部(拦掉浏览器默认的聚焦地址栏)
+    else if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === "l" || e.key === "L")) {
+      e.preventDefault(); clearToTop();
     }
   });
 
