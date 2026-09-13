@@ -106,6 +106,19 @@
   let token = params.get("token") || "";
   let authRequired = false;
   let ws = null, serOpen = false;
+  // 绑定的串口来自 URL 路径:/COM9 → targetPort="COM9";"/" → 空(选择页)
+  const targetPort = decodeURIComponent(location.pathname.replace(/^\/+/, ""));
+  // 该口的波特率:URL ?baud= 优先,其次 localStorage,默认 115200
+  function portBaud() {
+    return params.get("baud") ||
+      (targetPort && localStorage.getItem("sb_baud_" + targetPort)) || "115200";
+  }
+  // 导航到某个串口的专属页(自动打开)
+  function gotoPort(port, baud) {
+    if (!port) return;
+    const q = "?baud=" + encodeURIComponent(baud || $("baud").value) + (token ? "&token=" + encodeURIComponent(token) : "");
+    location.href = "/" + encodeURIComponent(port) + q;
+  }
 
   // ---- xterm.js 终端 ----
   const term = new Terminal({
@@ -212,20 +225,19 @@
   function setSerial(status) {
     serOpen = !!status.open;
     $("serdot").className = "dot " + (serOpen ? "on" : "off");
-    $("serlabel").textContent = serOpen ? `已打开 ${status.port} @ ${status.baudrate}` : "串口未打开";
+    $("serlabel").textContent = serOpen ? `已打开 ${status.port} @ ${status.baudrate}` : (targetPort ? targetPort + " 未打开" : "串口未打开");
     $("toggle").textContent = serOpen ? "关闭" : "打开";
-    $("port").disabled = serOpen;
-    $("baud").disabled = serOpen;
     if (status.error) errline("串口错误: " + status.error);
     if (serOpen) term.focus();
   }
 
-  // ---- WebSocket ----
+  // ---- WebSocket(仅绑定了端口时连接;/ 选择页不连)----
   function connect() {
+    if (!targetPort) return;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const q = authRequired ? `?token=${encodeURIComponent(token)}` : "";
-    ws = new WebSocket(`${proto}//${location.host}/ws${q}`);
-    ws.onopen = () => { $("wsdot").className = "dot on"; sysline("已连接到网关服务"); };
+    const qs = "?baud=" + encodeURIComponent(portBaud()) + (authRequired ? "&token=" + encodeURIComponent(token) : "");
+    ws = new WebSocket(`${proto}//${location.host}/ws/${encodeURIComponent(targetPort)}${qs}`);
+    ws.onopen = () => { $("wsdot").className = "dot on"; sysline("已连接到网关服务(" + targetPort + ")"); };
     ws.onclose = (e) => {
       $("wsdot").className = "dot off";
       if (e.code === 4401) {
@@ -260,18 +272,24 @@
       const res = await fetch(`/api/ports`);
       const list = await res.json();
       const sel = $("port");
-      const prev = sel.value;
       sel.innerHTML = "";
-      if (list.length === 0) {
-        const o = document.createElement("option"); o.textContent = "(无可用端口)"; o.value = ""; sel.appendChild(o);
-      }
+      const ph = document.createElement("option");
+      ph.value = ""; ph.textContent = targetPort ? "切换串口…" : "选择串口…";
+      sel.appendChild(ph);
+      let hasTarget = false;
       for (const p of list) {
         const o = document.createElement("option");
         o.value = p.device;
         o.textContent = p.description ? `${p.device} — ${p.description}` : p.device;
+        if (p.device === targetPort) { o.selected = true; hasTarget = true; }
         sel.appendChild(o);
       }
-      if (prev) sel.value = prev;
+      // 当前绑定的口即使不在枚举列表里(如已被占用)也补一项选中
+      if (targetPort && !hasTarget) {
+        const o = document.createElement("option");
+        o.value = targetPort; o.textContent = targetPort; o.selected = true;
+        sel.appendChild(o);
+      }
     } catch (e) { errline("获取端口列表失败: " + e); }
   }
 
@@ -350,14 +368,23 @@
   renderMacros();
 
   // ---- 事件绑定 ----
+  // 端口下拉:选中即导航到该口的专属页(自动打开)
+  $("port").onchange = () => { const p = $("port").value; if (p && p !== targetPort) gotoPort(p); };
+  // 关闭 / 重新打开当前绑定的口
   $("toggle").onclick = () => {
-    if (serOpen) { ws.send(JSON.stringify({ type: "close" })); }
-    else {
-      const port = $("port").value;
-      if (!port) { errline("请先选择端口"); return; }
-      ws.send(JSON.stringify({ type: "open", port, baudrate: parseInt($("baud").value, 10) }));
-    }
+    if (!targetPort) { errline("请先在上方选择串口"); return; }
+    if (!ws || ws.readyState !== WebSocket.OPEN) { errline("未连接到服务"); return; }
+    if (serOpen) ws.send(JSON.stringify({ type: "close" }));
+    else ws.send(JSON.stringify({ type: "open", port: targetPort, baudrate: parseInt($("baud").value, 10) }));
     term.focus();
+  };
+  // 波特率:绑定模式下改了就以新波特率重开,并记住(URL + localStorage)
+  $("baud").onchange = () => {
+    if (!targetPort) return;
+    try { localStorage.setItem("sb_baud_" + targetPort, $("baud").value); } catch (e) {}
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "open", port: targetPort, baudrate: parseInt($("baud").value, 10) }));
+    }
   };
   $("refresh").onclick = loadPorts;
   $("save").onclick = saveLog;
@@ -398,8 +425,17 @@
       authRequired = !!cfg.auth_required;
     } catch (e) { /* 拿不到就靠连接失败时再提示 */ }
     if (authRequired && !token) token = prompt("请输入访问 token:") || "";
+    // 恢复该口的波特率到下拉框
+    const b = portBaud();
+    if ([].some.call($("baud").options, (o) => o.value === b)) $("baud").value = b;
+    document.title = targetPort ? targetPort + " · 串口网关" : "串口网关";
     loadPorts();
-    connect();
+    if (targetPort) {
+      connect();                     // 绑定模式:连上即自动打开
+    } else {
+      sysline("请从上方「选择串口」下拉框选择一个串口(将打开它的专属页,可直接收藏)。");
+      $("toggle").disabled = true;
+    }
     term.focus();
   }
   init();
