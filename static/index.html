@@ -9,6 +9,12 @@
   :root {
     --bg: #1e1e1e; --panel: #252526; --border: #3c3c3c; --fg: #d4d4d4;
     --tx: #569cd6; --sys: #808080; --err: #f48771; --accent: #0e639c;
+    --inbg: #333;
+  }
+  body.light {
+    --bg: #ffffff; --panel: #f3f3f3; --border: #d0d0d0; --fg: #2b2b2b;
+    --tx: #1a56c4; --sys: #8a8a8a; --err: #c0341d; --accent: #1a73e8;
+    --inbg: #ffffff;
   }
   * { box-sizing: border-box; }
   body { margin: 0; height: 100vh; display: flex; flex-direction: column;
@@ -18,7 +24,7 @@
          background: var(--panel); border-bottom: 1px solid var(--border); }
   .bar label { color: var(--sys); }
   select, input, button {
-    background: #333; color: var(--fg); border: 1px solid var(--border);
+    background: var(--inbg); color: var(--fg); border: 1px solid var(--border);
     border-radius: 4px; padding: 5px 8px; font-size: 14px; font-family: inherit; }
   button { cursor: pointer; }
   button:hover { background: #3e3e42; }
@@ -35,10 +41,6 @@
   #term { flex: 1; min-height: 0; padding: 6px 8px; background: var(--bg); overflow: hidden; }
   .xterm { height: 100%; }
 
-  .send { display: flex; gap: 8px; align-items: center; padding: 8px 12px;
-          background: var(--panel); border-top: 1px solid var(--border); }
-  .prompt { color: var(--accent); font-family: "Cascadia Code", Consolas, monospace; font-weight: bold; }
-  #input { flex: 1; font-family: "Cascadia Code", Consolas, monospace; }
   .chk { display: flex; align-items: center; gap: 4px; color: var(--sys); user-select: none; }
   #macrobar { padding: 6px 12px; }
   #macros button { padding: 3px 10px; background: #2d2d30; }
@@ -59,6 +61,8 @@
     </select>
     <button id="toggle" class="primary">打开</button>
     <span class="sep"></span>
+    <label>主题</label>
+    <select id="theme"><option value="dark" selected>暗色</option><option value="light">亮色</option></select>
     <label class="chk"><input type="checkbox" id="hl" checked> 错误高亮</label>
     <label class="chk"><input type="checkbox" id="ts" checked> 时间戳</label>
     <button id="find" title="搜索 (Ctrl+F)">🔍</button>
@@ -89,21 +93,6 @@
   <!-- 实时终端:直接在这里敲,按键(含 Tab/退格/方向键)实时发给设备 -->
   <div id="term"></div>
 
-  <!-- 辅助发送栏:整行/HEX 发送(可选,主要交互直接在上面终端里敲) -->
-  <div class="send">
-    <span class="prompt">❯</span>
-    <input type="text" id="input" placeholder="整行发送(回车)/ 勾 HEX 按十六进制发送;直接在上方终端敲则实时发送" autocomplete="off" spellcheck="false">
-    <label class="chk"><input type="checkbox" id="sendHex"> HEX</label>
-    <label>结尾</label>
-    <select id="eol">
-      <option value="none">无</option>
-      <option value="cr">CR</option>
-      <option value="lf">LF</option>
-      <option value="crlf" selected>CRLF</option>
-    </select>
-    <button id="send" class="primary">发送</button>
-  </div>
-
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/addon-fit.js"></script>
 <script src="/static/vendor/addon-search.js"></script>
@@ -112,13 +101,10 @@
   "use strict";
   const $ = (id) => document.getElementById(id);
   const params = new URLSearchParams(location.search);
-  const EOL = { none: "", cr: "\r", lf: "\n", crlf: "\r\n" };
 
   let token = params.get("token") || "";
   let authRequired = false;
   let ws = null, serOpen = false;
-  const history = [];
-  let histIdx = -1, draft = "";
 
   // ---- xterm.js 终端 ----
   const term = new Terminal({
@@ -135,6 +121,29 @@
   term.open($("term"));
   fit.fit();
   window.addEventListener("resize", () => { try { fit.fit(); } catch (e) {} });
+
+  // ---- 亮/暗主题 ----
+  const THEMES = {
+    dark: {
+      background: "#1e1e1e", foreground: "#d4d4d4", cursor: "#d4d4d4", selectionBackground: "#264f78",
+      black: "#000000", red: "#f44747", green: "#4ec9b0", yellow: "#d7ba7d", blue: "#569cd6", magenta: "#c586c0", cyan: "#4ec9b0", white: "#d4d4d4",
+      brightBlack: "#808080", brightRed: "#f48771", brightGreen: "#b5cea8", brightYellow: "#dcdcaa", brightBlue: "#569cd6", brightMagenta: "#c586c0", brightCyan: "#9cdcfe", brightWhite: "#ffffff",
+    },
+    light: {
+      background: "#fbfbfb", foreground: "#2b2b2b", cursor: "#2b2b2b", selectionBackground: "#cfe3ff",
+      black: "#2b2b2b", red: "#c0341d", green: "#0a7f4b", yellow: "#8a6d00", blue: "#1a56c4", magenta: "#a625a4", cyan: "#0b7a86", white: "#5c5c5c",
+      brightBlack: "#8a8a8a", brightRed: "#d1361f", brightGreen: "#0a9c5b", brightYellow: "#a37b00", brightBlue: "#1a73e8", brightMagenta: "#c030c0", brightCyan: "#0b9aa8", brightWhite: "#000000",
+    },
+  };
+  function applyTheme(name) {
+    if (!THEMES[name]) name = "dark";
+    document.body.classList.toggle("light", name === "light");
+    term.options.theme = THEMES[name];
+    $("theme").value = name;
+    try { localStorage.setItem("sb_theme", name); } catch (e) {}
+  }
+  $("theme").onchange = () => applyTheme($("theme").value);
+  applyTheme((function () { try { return localStorage.getItem("sb_theme"); } catch (e) { return null; } })() || "dark");
 
   // 系统提示行(灰色斜体),不影响设备数据流
   function sysline(t) { term.writeln("\x1b[90m— " + t + "\x1b[0m"); }
@@ -250,36 +259,11 @@
     } catch (e) { errline("获取端口列表失败: " + e); }
   }
 
-  // ---- 辅助发送栏:整行/HEX 发送 ----
-  function sendLine() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) { errline("未连接到服务"); return; }
-    if (!serOpen) { errline("串口未打开"); return; }
-    const hexMode = $("sendHex").checked;
-    const raw = $("input").value;
-    let data = raw;
-    if (!hexMode) data += EOL[$("eol").value] || "";
-    ws.send(JSON.stringify({ type: "tx", data, encoding: hexMode ? "hex" : "utf8" }));
-    if (raw !== "" && history[history.length - 1] !== raw) history.push(raw);
-    histIdx = -1; draft = "";
-    $("input").value = "";
-    term.focus();
-  }
-  function recallHistory(dir) {
-    const inp = $("input");
-    if (history.length === 0) return;
-    if (histIdx === -1) { if (dir < 0) { draft = inp.value; histIdx = history.length - 1; } else return; }
-    else { histIdx += dir; }
-    if (histIdx >= history.length) { histIdx = -1; inp.value = draft; }
-    else if (histIdx < 0) { histIdx = 0; inp.value = history[0]; }
-    else { inp.value = history[histIdx]; }
-    requestAnimationFrame(() => inp.setSelectionRange(inp.value.length, inp.value.length));
-  }
-
-  // ---- 发送一条命令(快捷按钮用),按发送栏的行结尾设置 ----
+  // ---- 发送一条命令(快捷按钮用),行尾用 \r,和终端里回车一致 ----
   function sendCmd(cmd) {
     if (!ws || ws.readyState !== WebSocket.OPEN) { errline("未连接到服务"); return; }
     if (!serOpen) { errline("串口未打开"); return; }
-    ws.send(JSON.stringify({ type: "tx", data: cmd + (EOL[$("eol").value] || ""), encoding: "utf8" }));
+    ws.send(JSON.stringify({ type: "tx", data: cmd + "\r", encoding: "utf8" }));
     term.focus();
   }
 
@@ -362,35 +346,6 @@
   $("refresh").onclick = loadPorts;
   $("save").onclick = saveLog;
   $("clear").onclick = () => { term.clear(); tsPending = true; term.focus(); };
-  $("send").onclick = sendLine;
-  $("input").addEventListener("keydown", (e) => {
-    const inp = $("input");
-    if (e.key === "Enter") { e.preventDefault(); sendLine(); }
-    else if (e.key === "ArrowUp") { e.preventDefault(); recallHistory(-1); }
-    else if (e.key === "ArrowDown") { e.preventDefault(); recallHistory(1); }
-    // readline 风格行编辑(让发送栏像 shell 提示符)
-    else if (e.ctrlKey && (e.key === "u" || e.key === "U")) {   // 删到行首
-      e.preventDefault();
-      const c = inp.selectionStart;
-      inp.value = inp.value.slice(c);
-      inp.setSelectionRange(0, 0);
-    } else if (e.ctrlKey && (e.key === "k" || e.key === "K")) { // 删到行尾
-      e.preventDefault();
-      const c = inp.selectionStart;
-      inp.value = inp.value.slice(0, c);
-      inp.setSelectionRange(c, c);
-    } else if (e.ctrlKey && (e.key === "w" || e.key === "W")) { // 删前一个词
-      e.preventDefault();
-      const c = inp.selectionStart;
-      const left = inp.value.slice(0, c).replace(/\s*\S+\s*$/, "");
-      inp.value = left + inp.value.slice(c);
-      inp.setSelectionRange(left.length, left.length);
-    } else if (e.ctrlKey && (e.key === "a" || e.key === "A")) { // 光标到行首
-      e.preventDefault(); inp.setSelectionRange(0, 0);
-    } else if (e.ctrlKey && (e.key === "e" || e.key === "E")) { // 光标到行尾
-      e.preventDefault(); inp.setSelectionRange(inp.value.length, inp.value.length);
-    }
-  });
   // Ctrl+F 唤出搜索(拦截浏览器默认查找)
   document.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F")) {
